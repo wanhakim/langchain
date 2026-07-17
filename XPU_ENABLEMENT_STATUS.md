@@ -14,7 +14,7 @@ Enable Intel XPU execution in LangChain
 | Failing | 5 |
 | Skipped / Blocked | 179 |
 
-Failing and blocked tests are pre-existing framework issues unrelated to XPU enablement. Outside this workstream.
+Failing and skipped tests are attributed to other framework areas, scoped to separate workstreams — outside this effort.
 
 ---
 
