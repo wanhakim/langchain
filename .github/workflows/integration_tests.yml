@@ -43,6 +43,7 @@ on:
           - "openrouter"
           - "perplexity"
           - "qdrant"
+          - "vllm"
           - "xai"
       working-directory-override:
         type: string

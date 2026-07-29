@@ -1,0 +1,71 @@
+# Docker Compose for langchain-vllm integration tests on Intel XPU.
+#
+# Starts two vLLM servers (chat on device 0, embed on device 1):
+#   - chat server  on port 8000  (Qwen/Qwen2.5-0.5B-Instruct, ~1 GB)
+#   - embed server on port 8001  (BAAI/bge-small-en-v1.5, ~270 MB)
+#
+# Environment variables (all optional — set in shell before running):
+#   VLLM_CHAT_MODEL      Chat model                   (default: Qwen/Qwen2.5-0.5B-Instruct)
+#   VLLM_EMBED_MODEL     Embed model                  (default: BAAI/bge-small-en-v1.5)
+#   VLLM_GPU_MEM_UTIL    gpu_memory_utilization       (default: 0.4)
+#   ZE_AFFINITY_MASK     Intel GPU device index       (default: 0 for both servers)
+#   HTTP_PROXY / HTTPS_PROXY / NO_PROXY   forwarded into containers for model downloads
+
+services:
+  chat:
+    image: vllm/vllm-openai-xpu:v0.26.0
+    container_name: vllm-chat
+    entrypoint: ["bash", "-c"]
+    ports:
+      - "8000:8000"
+    ipc: host
+    privileged: true
+    restart: on-failure
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - /dev/dri/by-path:/dev/dri/by-path
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      ZE_AFFINITY_MASK: "0"
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+    command:
+      - |
+        source /opt/intel/oneapi/setvars.sh --force &&
+        vllm serve ${VLLM_CHAT_MODEL:-Qwen/Qwen2.5-0.5B-Instruct} \
+          --host 0.0.0.0 \
+          --port 8000 \
+          --max-model-len 512 \
+          --gpu-memory-utilization ${VLLM_GPU_MEM_UTIL:-0.4} \
+          --enable-auto-tool-choice \
+          --tool-call-parser hermes
+
+  embed:
+    image: vllm/vllm-openai-xpu:v0.26.0
+    container_name: vllm-embed
+    entrypoint: ["bash", "-c"]
+    ports:
+      - "8001:8000"
+    ipc: host
+    privileged: true
+    restart: on-failure
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - /dev/dri/by-path:/dev/dri/by-path
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      ZE_AFFINITY_MASK: "0"
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+    command:
+      - |
+        source /opt/intel/oneapi/setvars.sh --force &&
+        vllm serve ${VLLM_EMBED_MODEL:-BAAI/bge-small-en-v1.5} \
+          --host 0.0.0.0 \
+          --port 8000 \
+          --max-model-len 512 \
+          --runner pooling

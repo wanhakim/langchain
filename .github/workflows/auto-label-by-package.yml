@@ -55,6 +55,7 @@ jobs:
               "langchain-openrouter": "openrouter",
               "langchain-perplexity": "perplexity",
               "langchain-qdrant": "qdrant",
+              "langchain-vllm": "vllm",
               "langchain-xai": "xai",
             };
 
