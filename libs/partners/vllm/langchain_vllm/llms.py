@@ -126,7 +126,11 @@ class VLLM(BaseLLM):
     """Query params to send with every request."""
 
     extra_body: dict[str, Any] | None = None
-    """Extra JSON body params forwarded verbatim (e.g. `top_k`, `guided_json`)."""
+    """Extra JSON body params forwarded verbatim (e.g. `top_k`, `structured_outputs`).
+
+    See [`ChatVLLM.extra_body`][langchain_vllm.chat_models.ChatVLLM] for the
+    structured-output field naming (legacy `guided_*` vs current `structured_outputs`).
+    """
 
     model_kwargs: dict[str, Any] = Field(default_factory=dict)
     """Additional params passed through to the create call."""

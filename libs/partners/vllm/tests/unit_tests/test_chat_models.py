@@ -4,11 +4,18 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_tests.unit_tests import ChatModelUnitTests
 from pydantic import SecretStr
 
 from langchain_vllm._compat import (
+    _convert_delta_to_message_chunk,
     _convert_dict_to_message,
     _convert_message_to_dict,
     _create_usage_metadata,
@@ -145,6 +152,49 @@ def test_convert_dict_to_message_with_tool_calls() -> None:
     assert isinstance(message, AIMessage)
     assert message.tool_calls[0]["name"] == "get_weather"
     assert message.tool_calls[0]["args"] == {"city": "SF"}
+
+
+def test_convert_dict_to_message_reasoning_content() -> None:
+    """Older vLLM builds emit `reasoning_content`; it lands in additional_kwargs."""
+    message = _convert_dict_to_message(
+        {"role": "assistant", "content": "4", "reasoning_content": "2+2 is 4"}
+    )
+    assert isinstance(message, AIMessage)
+    assert message.additional_kwargs["reasoning_content"] == "2+2 is 4"
+
+
+def test_convert_dict_to_message_reasoning_field() -> None:
+    """Newer vLLM builds emit `reasoning`; it normalizes to `reasoning_content`.
+
+    Regression test for the reasoning-token loss reported in
+    `langchain-ai/langchain#36809`, where vLLM's migration from
+    `reasoning_content` to `reasoning` caused thinking tokens to be dropped.
+    """
+    message = _convert_dict_to_message(
+        {"role": "assistant", "content": "4", "reasoning": "2+2 is 4"}
+    )
+    assert isinstance(message, AIMessage)
+    assert message.additional_kwargs["reasoning_content"] == "2+2 is 4"
+
+
+def test_convert_delta_to_message_chunk_reasoning_field() -> None:
+    """Streaming deltas carrying `reasoning` are preserved (the #36809 path)."""
+    chunk = _convert_delta_to_message_chunk(
+        {"role": "assistant", "content": "", "reasoning": "thinking..."},
+        AIMessageChunk,
+    )
+    assert isinstance(chunk, AIMessageChunk)
+    assert chunk.additional_kwargs["reasoning_content"] == "thinking..."
+
+
+def test_convert_delta_to_message_chunk_reasoning_content() -> None:
+    """Streaming deltas carrying `reasoning_content` are preserved."""
+    chunk = _convert_delta_to_message_chunk(
+        {"role": "assistant", "content": "", "reasoning_content": "thinking..."},
+        AIMessageChunk,
+    )
+    assert isinstance(chunk, AIMessageChunk)
+    assert chunk.additional_kwargs["reasoning_content"] == "thinking..."
 
 
 def test_create_usage_metadata() -> None:

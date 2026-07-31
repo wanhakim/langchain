@@ -206,10 +206,18 @@ class ChatVLLM(BaseChatModel):
     extra_body: dict[str, Any] | None = None
     """Extra JSON body params forwarded verbatim to the server.
 
-    Use this for vLLM-specific sampling and guided-decoding params that are not
+    Use this for vLLM-specific sampling and structured-output params that are not
     first-class OpenAI fields, e.g. `top_k`, `repetition_penalty`, `min_p`,
-    `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`, or
-    `chat_template_kwargs`.
+    `chat_template_kwargs`, or `structured_outputs` (`json`, `regex`, `choice`,
+    `grammar`, `structural_tag`). See the vLLM
+    [structured outputs docs](https://docs.vllm.ai/en/stable/features/structured_outputs/).
+
+    !!! note
+
+        vLLM renamed these from the legacy top-level `guided_json` / `guided_regex`
+        / `guided_choice` / `guided_grammar` fields (removed in v0.12.0) to the
+        nested `structured_outputs` object. Because this dict is forwarded verbatim,
+        pass whichever form your server version expects.
     """
 
     model_kwargs: dict[str, Any] = Field(default_factory=dict)

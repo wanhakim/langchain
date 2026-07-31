@@ -200,8 +200,12 @@ def _convert_dict_to_message(_dict: Mapping[str, Any]) -> BaseMessage:
                     invalid_tool_calls.append(
                         make_invalid_tool_call(raw_tool_call, str(e))
                     )
-        if reasoning := _dict.get("reasoning_content"):
-            # Some vLLM reasoning models return a separate reasoning field.
+        # vLLM emits reasoning under two field names depending on version:
+        # older builds use `reasoning_content`, newer builds migrated to
+        # `reasoning`. Normalize both to `reasoning_content`.
+        if (reasoning_content := _dict.get("reasoning_content")) is not None:
+            additional_kwargs["reasoning_content"] = reasoning_content
+        elif (reasoning := _dict.get("reasoning")) is not None:
             additional_kwargs["reasoning_content"] = reasoning
         return AIMessage(
             content=content,
@@ -252,7 +256,11 @@ def _convert_delta_to_message_chunk(  # noqa: PLR0911
         if "name" in function_call and function_call["name"] is None:
             function_call["name"] = ""
         additional_kwargs["function_call"] = function_call
-    if reasoning := _dict.get("reasoning_content"):
+    # Match the non-streaming path: accept both `reasoning_content` (older
+    # vLLM) and `reasoning` (newer vLLM), normalizing to `reasoning_content`.
+    if (reasoning_content := _dict.get("reasoning_content")) is not None:
+        additional_kwargs["reasoning_content"] = reasoning_content
+    elif (reasoning := _dict.get("reasoning")) is not None:
         additional_kwargs["reasoning_content"] = reasoning
     tool_call_chunks = []
     if raw_tool_calls := _dict.get("tool_calls"):
