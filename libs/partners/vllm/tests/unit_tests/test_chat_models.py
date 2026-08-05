@@ -1,5 +1,6 @@
 """Unit tests for ChatVLLM."""
 
+import enum
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -11,8 +12,9 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.output_parsers import StrOutputParser
 from langchain_tests.unit_tests import ChatModelUnitTests
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr
 
 from langchain_vllm._compat import (
     _convert_delta_to_message_chunk,
@@ -20,7 +22,11 @@ from langchain_vllm._compat import (
     _convert_message_to_dict,
     _create_usage_metadata,
 )
-from langchain_vllm.chat_models import ChatVLLM
+from langchain_vllm.chat_models import (
+    ChatVLLM,
+    _deep_merge_extra_body,
+    _extract_guided_choices,
+)
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 
@@ -237,3 +243,323 @@ def test_create_chat_result_null_choices_raises(mock_openai: Any) -> None:
     llm = ChatVLLM(model=MODEL_NAME)
     with pytest.raises(TypeError, match="null value for 'choices'"):
         llm._create_chat_result({"choices": None})
+
+
+# ---------------------------------------------------------------------------
+# _extract_guided_choices helpers
+# ---------------------------------------------------------------------------
+
+
+class _Color(enum.Enum):
+    RED = "red"
+    GREEN = "green"
+    BLUE = "blue"
+
+
+def test_extract_guided_choices_list() -> None:
+    """A plain list of strings is returned verbatim with no enum map."""
+    wire, enum_map = _extract_guided_choices(["a", "b", "c"])
+    assert wire == ["a", "b", "c"]
+    assert enum_map is None
+
+
+def test_extract_guided_choices_enum() -> None:
+    """An Enum subclass produces wire values from .value and a reverse map."""
+    wire, enum_map = _extract_guided_choices(_Color)
+    assert wire == ["red", "green", "blue"]
+    assert enum_map is not None
+    assert enum_map["red"] is _Color.RED
+    assert enum_map["green"] is _Color.GREEN
+
+
+def test_extract_guided_choices_rejects_bare_string() -> None:
+    """A bare string should raise TypeError with a helpful message."""
+    with pytest.raises(TypeError, match="list of strings"):
+        _extract_guided_choices("yes")  # type: ignore[arg-type]
+
+
+def test_extract_guided_choices_rejects_empty_list() -> None:
+    """An empty list should raise ValueError."""
+    with pytest.raises(ValueError, match="empty"):
+        _extract_guided_choices([])
+
+
+def test_extract_guided_choices_rejects_empty_enum() -> None:
+    """An Enum with no members should raise ValueError."""
+
+    class Empty(enum.Enum):
+        pass
+
+    with pytest.raises(ValueError, match="at least one member"):
+        _extract_guided_choices(Empty)
+
+
+# ---------------------------------------------------------------------------
+# _deep_merge_extra_body
+# ---------------------------------------------------------------------------
+
+
+def test_deep_merge_extra_body_no_overlap() -> None:
+    """Keys that don't overlap are merged without loss."""
+    result = _deep_merge_extra_body(
+        {"top_k": 5}, {"structured_outputs": {"choice": ["a"]}}
+    )
+    assert result == {"top_k": 5, "structured_outputs": {"choice": ["a"]}}
+
+
+def test_deep_merge_extra_body_structured_outputs_union() -> None:
+    """Nested structured_outputs sub-keys are unioned."""
+    base = {"structured_outputs": {"foo": 1}}
+    overlay = {"structured_outputs": {"choice": ["a", "b"]}}
+    result = _deep_merge_extra_body(base, overlay)
+    assert result["structured_outputs"] == {"foo": 1, "choice": ["a", "b"]}
+
+
+def test_deep_merge_extra_body_overlay_wins_scalar() -> None:
+    """For scalar keys outside structured_outputs, overlay wins."""
+    result = _deep_merge_extra_body({"x": 1}, {"x": 2})
+    assert result["x"] == 2
+
+
+# ---------------------------------------------------------------------------
+# with_guided_choice — payload shape
+# ---------------------------------------------------------------------------
+
+
+def test_guided_choice_list_extra_body() -> None:
+    """with_guided_choice with a list produces the correct structured_outputs fragment.
+    """
+    llm = ChatVLLM(model=MODEL_NAME)
+    bound = llm.with_guided_choice(["positive", "negative", "neutral"])
+    # The bound runnable's LLM step carries the extra_body kwarg
+    llm_step = bound.first  # type: ignore[attr-defined]
+    assert llm_step.kwargs["extra_body"] == {
+        "structured_outputs": {"choice": ["positive", "negative", "neutral"]}
+    }
+
+
+def test_guided_choice_enum_extra_body() -> None:
+    """with_guided_choice with an Enum uses .value strings in order."""
+    llm = ChatVLLM(model=MODEL_NAME)
+    bound = llm.with_guided_choice(_Color)
+    llm_step = bound.first  # type: ignore[attr-defined]
+    assert llm_step.kwargs["extra_body"] == {
+        "structured_outputs": {"choice": ["red", "green", "blue"]}
+    }
+
+
+def test_guided_regex_extra_body() -> None:
+    """with_guided_regex lands the pattern under structured_outputs.regex."""
+    llm = ChatVLLM(model=MODEL_NAME)
+    bound = llm.with_guided_regex(r"\d{3}-\d{4}")
+    llm_step = bound.first  # type: ignore[attr-defined]
+    assert llm_step.kwargs["extra_body"] == {
+        "structured_outputs": {"regex": r"\d{3}-\d{4}"}
+    }
+
+
+def test_guided_grammar_extra_body() -> None:
+    """with_guided_grammar lands the grammar under structured_outputs.grammar."""
+    llm = ChatVLLM(model=MODEL_NAME)
+    grammar = 'root ::= "yes" | "no"'
+    bound = llm.with_guided_grammar(grammar)
+    llm_step = bound.first  # type: ignore[attr-defined]
+    assert llm_step.kwargs["extra_body"] == {"structured_outputs": {"grammar": grammar}}
+
+
+def test_guided_json_extra_body() -> None:
+    """with_structured_output(method='guided_json') uses structured_outputs.json."""
+
+    class City(BaseModel):
+        name: str
+        country: str
+
+    llm = ChatVLLM(model=MODEL_NAME)
+    bound = llm.with_structured_output(City, method="guided_json")
+    llm_step = bound.first  # type: ignore[attr-defined]
+    extra_body = llm_step.kwargs["extra_body"]
+    assert "structured_outputs" in extra_body
+    assert "json" in extra_body["structured_outputs"]
+    assert extra_body["structured_outputs"]["json"]["title"] == "City"
+
+
+# ---------------------------------------------------------------------------
+# Legacy wire format
+# ---------------------------------------------------------------------------
+
+
+def test_guided_choice_legacy_format() -> None:
+    """structured_outputs_format='legacy' emits top-level guided_choice."""
+    llm = ChatVLLM(model=MODEL_NAME, structured_outputs_format="legacy")
+    bound = llm.with_guided_choice(["a", "b"])
+    llm_step = bound.first  # type: ignore[attr-defined]
+    assert llm_step.kwargs["extra_body"] == {"guided_choice": ["a", "b"]}
+
+
+def test_guided_regex_legacy_format() -> None:
+    """structured_outputs_format='legacy' emits top-level guided_regex."""
+    llm = ChatVLLM(model=MODEL_NAME, structured_outputs_format="legacy")
+    bound = llm.with_guided_regex(r"\d+")
+    llm_step = bound.first  # type: ignore[attr-defined]
+    assert llm_step.kwargs["extra_body"] == {"guided_regex": r"\d+"}
+
+
+def test_guided_grammar_legacy_format() -> None:
+    """structured_outputs_format='legacy' emits top-level guided_grammar."""
+    llm = ChatVLLM(model=MODEL_NAME, structured_outputs_format="legacy")
+    bound = llm.with_guided_grammar('root ::= "x"')
+    llm_step = bound.first  # type: ignore[attr-defined]
+    assert llm_step.kwargs["extra_body"] == {"guided_grammar": 'root ::= "x"'}
+
+
+def test_guided_json_legacy_format() -> None:
+    """with_structured_output(method='guided_json', legacy) emits guided_json."""
+
+    class Tag(BaseModel):
+        label: str
+
+    llm = ChatVLLM(model=MODEL_NAME, structured_outputs_format="legacy")
+    bound = llm.with_structured_output(Tag, method="guided_json")
+    llm_step = bound.first  # type: ignore[attr-defined]
+    extra_body = llm_step.kwargs["extra_body"]
+    assert "guided_json" in extra_body
+    assert extra_body["guided_json"]["title"] == "Tag"
+
+
+# ---------------------------------------------------------------------------
+# guided_decoding_backend propagation
+# ---------------------------------------------------------------------------
+
+
+def test_guided_decoding_backend_added() -> None:
+    """guided_decoding_backend is a top-level extra_body key."""
+    llm = ChatVLLM(model=MODEL_NAME)
+    bound = llm.with_guided_choice(["yes", "no"], guided_decoding_backend="xgrammar")
+    llm_step = bound.first  # type: ignore[attr-defined]
+    eb = llm_step.kwargs["extra_body"]
+    assert eb["guided_decoding_backend"] == "xgrammar"
+    assert "structured_outputs" in eb
+
+
+def test_guided_decoding_backend_legacy() -> None:
+    """guided_decoding_backend is top-level even in legacy format."""
+    llm = ChatVLLM(model=MODEL_NAME, structured_outputs_format="legacy")
+    bound = llm.with_guided_regex(r"\d+", guided_decoding_backend="outlines")
+    llm_step = bound.first  # type: ignore[attr-defined]
+    eb = llm_step.kwargs["extra_body"]
+    assert eb["guided_decoding_backend"] == "outlines"
+    assert "guided_regex" in eb
+
+
+# ---------------------------------------------------------------------------
+# Merge: instance extra_body + guided fragment
+# ---------------------------------------------------------------------------
+
+
+@patch("langchain_vllm._utils.openai.OpenAI")
+def test_guided_choice_merges_with_instance_extra_body(mock_openai: Any) -> None:
+    """Instance-level extra_body is deep-merged with the guided fragment."""
+    mock_client = MagicMock()
+    mock_openai.return_value.chat.completions = mock_client
+    mock_client.create.return_value = {
+        "id": "x",
+        "model": MODEL_NAME,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "yes"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+    llm = ChatVLLM(model=MODEL_NAME, extra_body={"top_k": 5})
+    llm.with_guided_choice(["yes", "no"]).invoke("test")
+    call_kwargs = mock_client.create.call_args.kwargs
+    eb = call_kwargs["extra_body"]
+    # Both keys must survive in the merged payload
+    assert eb["top_k"] == 5
+    assert eb["structured_outputs"]["choice"] == ["yes", "no"]
+
+
+@patch("langchain_vllm._utils.openai.OpenAI")
+def test_guided_no_clobber_user_structured_outputs(mock_openai: Any) -> None:
+    """User's existing structured_outputs sub-keys are preserved during merge."""
+    mock_client = MagicMock()
+    mock_openai.return_value.chat.completions = mock_client
+    mock_client.create.return_value = {
+        "id": "x",
+        "model": MODEL_NAME,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "yes"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+    llm = ChatVLLM(model=MODEL_NAME, extra_body={"structured_outputs": {"foo": 1}})
+    llm.with_guided_choice(["yes", "no"]).invoke("test")
+    call_kwargs = mock_client.create.call_args.kwargs
+    eb = call_kwargs["extra_body"]
+    assert eb["structured_outputs"]["foo"] == 1
+    assert eb["structured_outputs"]["choice"] == ["yes", "no"]
+
+
+# ---------------------------------------------------------------------------
+# Parser behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_guided_choice_enum_maps_output() -> None:
+    """The Enum mapping runnable converts the wire string to the Enum member."""
+    llm = ChatVLLM(model=MODEL_NAME)
+    runnable = llm.with_guided_choice(_Color)
+    # Extract and exercise just the parser chain (second step after the LLM)
+    parser_chain = runnable.last  # type: ignore[attr-defined]
+    result = parser_chain.invoke("green")
+    assert result is _Color.GREEN
+
+
+def test_guided_choice_enum_strips_whitespace() -> None:
+    """Trailing whitespace/newline is stripped before the Enum lookup."""
+    llm = ChatVLLM(model=MODEL_NAME)
+    parser_chain = llm.with_guided_choice(_Color).last  # type: ignore[attr-defined]
+    assert parser_chain.invoke("blue\n") is _Color.BLUE
+
+
+def test_guided_regex_returns_str_parser() -> None:
+    """with_guided_regex uses StrOutputParser as its tail parser."""
+    llm = ChatVLLM(model=MODEL_NAME)
+    runnable = llm.with_guided_regex(r"\d+")
+    parser = runnable.last  # type: ignore[attr-defined]
+    assert isinstance(parser, StrOutputParser)
+
+
+def test_guided_choice_rejects_bare_string() -> None:
+    """with_guided_choice raises TypeError when passed a bare string."""
+    llm = ChatVLLM(model=MODEL_NAME)
+    with pytest.raises(TypeError, match="list of strings"):
+        llm.with_guided_choice("yes")  # type: ignore[arg-type]
+
+
+def test_guided_choice_rejects_empty() -> None:
+    """with_guided_choice raises ValueError for an empty list."""
+    llm = ChatVLLM(model=MODEL_NAME)
+    with pytest.raises(ValueError, match="empty"):
+        llm.with_guided_choice([])
+
+
+def test_guided_regex_rejects_empty() -> None:
+    """with_guided_regex raises ValueError for an empty pattern."""
+    llm = ChatVLLM(model=MODEL_NAME)
+    with pytest.raises(ValueError, match="non-empty"):
+        llm.with_guided_regex("")
+
+
+def test_guided_grammar_rejects_empty() -> None:
+    """with_guided_grammar raises ValueError for an empty grammar string."""
+    llm = ChatVLLM(model=MODEL_NAME)
+    with pytest.raises(ValueError, match="non-empty"):
+        llm.with_guided_grammar("")

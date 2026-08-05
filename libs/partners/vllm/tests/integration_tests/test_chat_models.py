@@ -1,6 +1,8 @@
 """Integration tests for ChatVLLM."""
 
+import enum
 import os
+import re
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -203,3 +205,96 @@ def test_structured_output_json_mode() -> None:
         .invoke('Return JSON: {"city": "Paris"}')
     )
     assert isinstance(result, dict)
+
+
+# ---------------------------------------------------------------------------
+# Guided decoding integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_guided_choice_classification() -> None:
+    """with_guided_choice forces the model to emit exactly one of the labels.
+
+    This is the headline use case: constrained decoding guarantees the output
+    is in the choice set at the token level, which is impossible via the OpenAI
+    structured-output API.
+    """
+    choices = ["positive", "negative", "neutral"]
+    result = (
+        _chat(max_tokens=16)
+        .with_guided_choice(choices)
+        .invoke("I absolutely love this product!")
+    )
+    assert result in choices
+
+
+def test_guided_choice_enum() -> None:
+    """with_guided_choice with an Enum returns the corresponding Enum member."""
+
+    class Intent(enum.Enum):
+        BILLING = "billing"
+        TECHNICAL = "technical"
+        SALES = "sales"
+
+    result = (
+        _chat(max_tokens=16)
+        .with_guided_choice(Intent)
+        .invoke("My card was charged twice this month.")
+    )
+    assert isinstance(result, Intent)
+
+
+def test_guided_regex() -> None:
+    """with_guided_regex forces output to match the provided pattern."""
+    pattern = r"\d{3}-\d{4}"
+    result = (
+        _chat(max_tokens=16)
+        .with_guided_regex(pattern)
+        .invoke("Give me a 7-digit phone number like 555-1234.")
+    )
+    assert re.fullmatch(pattern, result), f"Output {result!r} does not match {pattern}"
+
+
+def test_guided_json() -> None:
+    """guided_json method of with_structured_output returns a Pydantic instance."""
+
+    class City(BaseModel):
+        """A city and its country."""
+
+        name: str = Field(description="City name")
+        country: str = Field(description="Country name")
+
+    result = (
+        _chat(max_tokens=128)
+        .with_structured_output(City, method="guided_json")
+        .invoke("Tell me about Paris.")
+    )
+    assert isinstance(result, City)
+    assert result.name
+    assert result.country
+
+
+def test_guided_choice_streaming() -> None:
+    """Streaming a guided-choice runnable yields the final label."""
+    choices = ["positive", "negative", "neutral"]
+    chunks = list(
+        _chat(max_tokens=16)
+        .with_guided_choice(choices)
+        .stream("This product is terrible.")
+    )
+    full = "".join(chunks)
+    assert full.strip() in choices
+
+
+def test_guided_choice_include_raw() -> None:
+    """include_raw=True returns a dict with raw/parsed/parsing_error keys."""
+    choices = ["yes", "no"]
+    result = (
+        _chat(max_tokens=16)
+        .with_guided_choice(choices, include_raw=True)
+        .invoke("Is the sky blue?")
+    )
+    assert isinstance(result, dict)
+    assert set(result.keys()) >= {"raw", "parsed", "parsing_error"}
+    assert isinstance(result["raw"], AIMessage)
+    assert result["parsed"] in choices

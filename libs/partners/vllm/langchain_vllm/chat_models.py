@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import enum
 import logging
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from operator import itemgetter
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast, get_args, get_origin, overload
 
 import openai
 from langchain_core.callbacks import (
@@ -30,9 +31,15 @@ from langchain_core.output_parsers import (
     JsonOutputParser,
     PydanticOutputParser,
     PydanticToolsParser,
+    StrOutputParser,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.runnables import Runnable, RunnableMap, RunnablePassthrough
+from langchain_core.runnables import (
+    Runnable,
+    RunnableLambda,
+    RunnableMap,
+    RunnablePassthrough,
+)
 from langchain_core.tools import BaseTool
 from langchain_core.utils import secret_from_env
 from langchain_core.utils.function_calling import (
@@ -69,12 +76,94 @@ log = logging.getLogger(__name__)
 DEFAULT_BASE_URL = "http://localhost:8000/v1"
 
 
+EnumT = TypeVar("EnumT", bound=enum.Enum)
+
+
 def _is_pydantic_class(obj: Any) -> bool:
     return isinstance(obj, type) and is_basemodel_subclass(obj)
 
 
+def _extract_guided_choices(
+    choices: Sequence[str] | type[enum.Enum],
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Return ``(wire_choices, enum_map_or_none)`` for a guided-choice constraint.
+
+    Args:
+        choices: A non-empty list/tuple of strings, a ``Literal[...]`` alias, or
+            an ``enum.Enum`` subclass whose ``.value`` attributes are used as the
+            wire labels.
+
+    Returns:
+        A pair ``(wire_choices, enum_map)`` where ``wire_choices`` is the list of
+        strings to send to the server and ``enum_map`` is a ``{str: EnumMember}``
+        reverse-lookup dict (only set when ``choices`` is an Enum class, so the
+        returned string can be mapped back to the original member).
+
+    Raises:
+        ValueError: If ``choices`` is a bare string, empty, or an unsupported type.
+    """
+    if isinstance(choices, str):
+        msg = (
+            "Pass a list of strings, not a single string. "
+            "Example: with_guided_choice(['yes', 'no'])"
+        )
+        raise TypeError(msg)
+
+    # Literal[...] alias — detect via typing internals
+    _origin = get_origin(choices)
+    _is_literal = _origin is Literal or (
+        hasattr(choices, "__origin__")
+        and str(getattr(choices, "__origin__", "")) == "Literal"
+    )
+    if _is_literal:
+        args = get_args(choices)
+        if not args:
+            msg = "choices must not be empty."
+            raise ValueError(msg)
+        return [str(a) for a in args], None
+
+    # enum.Enum subclass
+    if isinstance(choices, type) and issubclass(choices, enum.Enum):
+        members = list(choices)
+        if not members:
+            msg = "choices Enum must have at least one member."
+            raise ValueError(msg)
+        wire = [str(m.value) for m in members]
+        enum_map: dict[str, Any] = {str(m.value): m for m in members}
+        return wire, enum_map
+
+    # Sequence[str]
+    wire_list = list(choices)  # type: ignore[arg-type]
+    if not wire_list:
+        msg = "choices must not be empty."
+        raise ValueError(msg)
+    return wire_list, None
+
+
+def _deep_merge_extra_body(
+    base: dict[str, Any], overlay: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge two ``extra_body`` dicts, deep-merging the ``structured_outputs`` sub-dict.
+
+    Args:
+        base: The base dict (typically from ``self.extra_body``).
+        overlay: The overlay dict (typically a guided-decoding fragment).
+
+    Returns:
+        A new dict with the ``structured_outputs`` key deep-merged (union of sub-keys,
+        overlay wins on conflicts) and all other keys shallow-merged (overlay wins).
+    """
+    merged = {**base, **overlay}
+    if "structured_outputs" in base and "structured_outputs" in overlay:
+        merged["structured_outputs"] = {
+            **base["structured_outputs"],
+            **overlay["structured_outputs"],
+        }
+    return merged
+
+
 class ChatVLLM(BaseChatModel):
-    """vLLM chat model integration.
+    r"""vLLM chat model integration.
 
     Connects to a running vLLM
     [OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html)
@@ -130,6 +219,62 @@ class ChatVLLM(BaseChatModel):
         for chunk in llm.stream("Hello!"):
             print(chunk.text, end="")
         ```
+
+    Guided decoding:
+        vLLM supports **constrained / guided decoding** — forcing the model to emit
+        output that matches a fixed set of labels, a regex pattern, or a grammar.
+        This has **no equivalent in the OpenAI API** and is the primary reason to use
+        this dedicated integration instead of pointing ``ChatOpenAI`` at a local server.
+
+        Force the model to emit exactly one of a set of labels (classification/routing):
+
+        ```python
+        classifier = llm.with_guided_choice(["positive", "negative", "neutral"])
+        classifier.invoke("I absolutely love this product!")
+        # -> "positive"   (guaranteed in the set, no parsing needed)
+        ```
+
+        Use an ``enum.Enum`` and get a real member back:
+
+        ```python
+        import enum
+
+        class Intent(enum.Enum):
+            BILLING = "billing"
+            TECHNICAL = "technical"
+            SALES = "sales"
+
+        router = llm.with_guided_choice(Intent)
+        intent = router.invoke("My card was charged twice")
+        # -> Intent.BILLING
+        ```
+
+        Force a regex pattern or a grammar:
+
+        ```python
+        phone = llm.with_guided_regex(r"(\d{3}) \d{3}-\d{4}")
+        sql = llm.with_guided_grammar(gbnf_grammar_str)
+        ```
+
+    Structured output:
+        Standard JSON-schema structured output uses OpenAI's ``response_format``:
+
+        ```python
+        llm.with_structured_output(City, method="json_schema")
+        ```
+
+        To route through vLLM's own ``guided_json`` constrained decoder instead:
+
+        ```python
+        llm.with_structured_output(City, method="guided_json")
+        ```
+
+    Key init args — guided decoding params:
+        structured_outputs_format: Literal["structured_outputs", "legacy"]
+            Wire format for guided-decoding parameters. ``"structured_outputs"``
+            (default) uses the nested ``{"structured_outputs": {...}}`` object
+            supported by vLLM ≥ 0.12.0. Set to ``"legacy"`` for older servers that
+            still expect top-level ``guided_choice`` / ``guided_regex`` / etc. fields.
     """
 
     model: str = Field(alias="model_name")
@@ -206,18 +351,39 @@ class ChatVLLM(BaseChatModel):
     extra_body: dict[str, Any] | None = None
     """Extra JSON body params forwarded verbatim to the server.
 
-    Use this for vLLM-specific sampling and structured-output params that are not
-    first-class OpenAI fields, e.g. `top_k`, `repetition_penalty`, `min_p`,
-    `chat_template_kwargs`, or `structured_outputs` (`json`, `regex`, `choice`,
-    `grammar`, `structural_tag`). See the vLLM
+    Use this for vLLM-specific sampling params not covered by first-class fields,
+    e.g. `top_k`, `repetition_penalty`, `min_p`, `chat_template_kwargs`.
+
+    For guided / constrained decoding, prefer the typed helpers
+    `with_guided_choice`, `with_guided_regex`, and `with_guided_grammar`, which
+    build the correct wire payload automatically and respect
+    `structured_outputs_format`. Raw usage:
+
+    ```python
+    # vLLM >= 0.12.0 (default structured_outputs_format)
+    llm = ChatVLLM(..., extra_body={"structured_outputs": {"choice": ["yes", "no"]}})
+
+    # vLLM < 0.12.0 (legacy format)
+    llm = ChatVLLM(..., extra_body={"guided_choice": ["yes", "no"]})
+    ```
+
+    See the vLLM
     [structured outputs docs](https://docs.vllm.ai/en/stable/features/structured_outputs/).
+    """
 
-    !!! note
+    structured_outputs_format: Literal["structured_outputs", "legacy"] = (
+        "structured_outputs"
+    )
+    """Wire format for vLLM guided-decoding params.
 
-        vLLM renamed these from the legacy top-level `guided_json` / `guided_regex`
-        / `guided_choice` / `guided_grammar` fields (removed in v0.12.0) to the
-        nested `structured_outputs` object. Because this dict is forwarded verbatim,
-        pass whichever form your server version expects.
+    - `"structured_outputs"` (default): the nested ``{"structured_outputs": {...}}``
+      object introduced in vLLM 0.12.0.
+    - `"legacy"`: top-level ``guided_choice`` / ``guided_regex`` / ``guided_grammar``
+      / ``guided_json`` fields supported by vLLM < 0.12.0.
+
+    The `with_guided_choice`, `with_guided_regex`, `with_guided_grammar`, and
+    ``with_structured_output(method="guided_json")`` helpers read this field and emit
+    the correct payload automatically.
     """
 
     model_kwargs: dict[str, Any] = Field(default_factory=dict)
@@ -335,8 +501,78 @@ class ChatVLLM(BaseChatModel):
         if stop is not None:
             kwargs["stop"] = stop
         payload = {**self._default_params, **kwargs}
+        # Deep-merge extra_body so a bound guided-decoding fragment combines with
+        # any instance-level extra_body instead of clobbering it.
+        if "extra_body" in kwargs and self.extra_body:
+            payload["extra_body"] = _deep_merge_extra_body(
+                self.extra_body, kwargs["extra_body"]
+            )
         payload["messages"] = [_convert_message_to_dict(m) for m in messages]
         return payload
+
+    def _build_guided_extra_body(
+        self,
+        *,
+        kind: Literal["choice", "regex", "grammar", "json"],
+        value: Any,
+        guided_decoding_backend: str | None,
+    ) -> dict[str, Any]:
+        """Build the ``extra_body`` fragment for one guided-decoding primitive.
+
+        Args:
+            kind: The type of constraint (`"choice"`, `"regex"`, `"grammar"`, or
+                `"json"`).
+            value: The constraint value (list of strings for choice, string for
+                regex/grammar, dict for json).
+            guided_decoding_backend: Optional backend selector forwarded as a
+                top-level ``extra_body`` key (e.g. ``"xgrammar"``).
+
+        Returns:
+            A dict suitable for passing as ``extra_body`` to ``bind``.
+        """
+        if self.structured_outputs_format == "structured_outputs":
+            fragment: dict[str, Any] = {"structured_outputs": {kind: value}}
+        else:
+            legacy_key = {
+                "choice": "guided_choice",
+                "regex": "guided_regex",
+                "grammar": "guided_grammar",
+                "json": "guided_json",
+            }[kind]
+            fragment = {legacy_key: value}
+        if guided_decoding_backend is not None:
+            fragment["guided_decoding_backend"] = guided_decoding_backend
+        return fragment
+
+    def _wrap_with_include_raw(
+        self,
+        llm: Runnable,
+        output_parser: Runnable,
+        *,
+        include_raw: bool,
+    ) -> Runnable:
+        """Wrap ``llm | output_parser`` with the standard ``include_raw`` envelope.
+
+        Args:
+            llm: The bound LLM runnable.
+            output_parser: The output parser to apply.
+            include_raw: If ``True``, return a dict with ``'raw'``, ``'parsed'``,
+                and ``'parsing_error'`` keys.
+
+        Returns:
+            A `Runnable` that either chains directly or returns the raw/parsed dict.
+        """
+        if include_raw:
+            parser_assign = RunnablePassthrough.assign(
+                parsed=itemgetter("raw") | output_parser,
+                parsing_error=lambda _: None,
+            )
+            parser_none = RunnablePassthrough.assign(parsed=lambda _: None)
+            parser_with_fallback = parser_assign.with_fallbacks(
+                [parser_none], exception_key="parsing_error"
+            )
+            return RunnableMap(raw=llm) | parser_with_fallback
+        return llm | output_parser
 
     def _create_chat_result(
         self,
@@ -593,10 +829,11 @@ class ChatVLLM(BaseChatModel):
         schema: dict | type,
         *,
         method: Literal[
-            "function_calling", "json_mode", "json_schema"
+            "function_calling", "json_mode", "json_schema", "guided_json"
         ] = "function_calling",
         include_raw: bool = False,
         strict: bool | None = None,
+        guided_decoding_backend: str | None = None,
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, dict | BaseModel]:
         """Model wrapper that returns outputs formatted to match the given schema.
@@ -608,13 +845,18 @@ class ChatVLLM(BaseChatModel):
 
                 - `'function_calling'`: uses tool calling (requires the server to
                     be launched with tool-calling support).
-                - `'json_schema'`: uses vLLM guided decoding via OpenAI-style
+                - `'json_schema'`: uses OpenAI-style
                     `response_format={'type': 'json_schema', ...}`.
                 - `'json_mode'`: uses `response_format={'type': 'json_object'}`. You
                     must instruct the model to produce JSON matching the schema.
+                - `'guided_json'`: routes through vLLM's constrained ``guided_json``
+                    decoder (sent as ``extra_body``). Uses `structured_outputs_format`
+                    to pick the correct wire shape for the server version.
             include_raw: If `True`, return a dict with `'raw'`, `'parsed'`, and
                 `'parsing_error'` keys.
             strict: If `True`, requests strict schema adherence (function calling).
+            guided_decoding_backend: Backend selector for ``method='guided_json'``
+                (e.g. ``"xgrammar"``). Forwarded as a top-level ``extra_body`` key.
             kwargs: Additional keyword args are not supported.
 
         Returns:
@@ -694,20 +936,254 @@ class ChatVLLM(BaseChatModel):
                     "schema": json_schema,
                 },
             )
+        elif method == "guided_json":
+            if schema is None:
+                msg = "schema must be specified when method is 'guided_json'."
+                raise ValueError(msg)
+            if is_pydantic_schema:
+                schema = cast("TypeBaseModel", schema)
+                if issubclass(schema, BaseModelV1):
+                    json_schema = schema.schema()
+                else:
+                    json_schema = schema.model_json_schema()
+                output_parser = PydanticOutputParser(pydantic_object=schema)
+            else:
+                if is_typeddict(schema):
+                    json_schema = convert_to_json_schema(schema)
+                    if "required" not in json_schema:
+                        json_schema["required"] = list(json_schema["properties"].keys())
+                else:
+                    json_schema = cast("dict", schema)
+                output_parser = JsonOutputParser()
+            extra_body = self._build_guided_extra_body(
+                kind="json",
+                value=json_schema,
+                guided_decoding_backend=guided_decoding_backend,
+            )
+            llm = self.bind(
+                extra_body=extra_body,
+                ls_structured_output_format={
+                    "kwargs": {"method": method},
+                    "schema": json_schema,
+                },
+            )
         else:
             msg = (
                 "Unrecognized method argument. Expected one of 'function_calling', "
-                f"'json_schema', or 'json_mode'. Received: '{method}'"
+                f"'json_schema', 'json_mode', or 'guided_json'. Received: '{method}'"
             )
             raise ValueError(msg)
 
-        if include_raw:
-            parser_assign = RunnablePassthrough.assign(
-                parsed=itemgetter("raw") | output_parser, parsing_error=lambda _: None
+        return self._wrap_with_include_raw(llm, output_parser, include_raw=include_raw)
+
+    @overload
+    def with_guided_choice(
+        self,
+        choices: type[EnumT],
+        *,
+        include_raw: bool = ...,
+        guided_decoding_backend: str | None = ...,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, EnumT]: ...
+
+    @overload
+    def with_guided_choice(
+        self,
+        choices: Sequence[str],
+        *,
+        include_raw: bool = ...,
+        guided_decoding_backend: str | None = ...,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, str]: ...
+
+    def with_guided_choice(
+        self,
+        choices: Sequence[str] | type[enum.Enum],
+        *,
+        include_raw: bool = False,
+        guided_decoding_backend: str | None = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, Any]:
+        """Force the model to emit exactly one of a fixed set of labels.
+
+        This uses vLLM's **guided / constrained decoding** to guarantee the output
+        matches one of the provided choices at the token level — no parsing, no
+        validation, no "sorry I can't answer that" escapes. This capability has
+        **no equivalent in the OpenAI API** and is the primary reason to use this
+        integration instead of pointing ``ChatOpenAI`` at a local vLLM server.
+
+        Args:
+            choices: A non-empty list/tuple of strings, or an ``enum.Enum`` subclass
+                whose ``.value`` attributes are used as the wire labels. When an Enum
+                is passed, the returned runnable maps the output string back to the
+                corresponding Enum member.
+            include_raw: If ``True``, return a dict with ``'raw'``, ``'parsed'``, and
+                ``'parsing_error'`` keys instead of the label directly.
+            guided_decoding_backend: Optional backend selector forwarded to vLLM
+                (e.g. ``"xgrammar"``).
+            kwargs: Passed through to ``bind``.
+
+        Returns:
+            A ``Runnable`` that returns a ``str`` (or an Enum member when an Enum
+            subclass is passed) guaranteed to be one of the provided choices.
+
+        Example:
+            Classify sentiment — the model is forced to emit exactly one label:
+
+            ```python
+            classifier = llm.with_guided_choice(["positive", "negative", "neutral"])
+            classifier.invoke("I absolutely love this product!")
+            # -> "positive"
+            ```
+
+            Route with an Enum and get a real member back:
+
+            ```python
+            import enum
+
+            class Intent(enum.Enum):
+                BILLING = "billing"
+                TECHNICAL = "technical"
+                SALES = "sales"
+
+            router = llm.with_guided_choice(Intent)
+            intent = router.invoke("My card was charged twice")
+            # -> Intent.BILLING
+            ```
+        """
+        wire_choices, enum_map = _extract_guided_choices(choices)
+        extra_body = self._build_guided_extra_body(
+            kind="choice",
+            value=wire_choices,
+            guided_decoding_backend=guided_decoding_backend,
+        )
+        llm = self.bind(
+            extra_body=extra_body,
+            ls_structured_output_format={
+                "kwargs": {"method": "guided_choice"},
+                "schema": {"choice": wire_choices},
+            },
+            **kwargs,
+        )
+        if enum_map is not None:
+            _map = enum_map
+            output_parser: Runnable = StrOutputParser() | RunnableLambda(
+                lambda s, m=_map: m[s.strip()]
             )
-            parser_none = RunnablePassthrough.assign(parsed=lambda _: None)
-            parser_with_fallback = parser_assign.with_fallbacks(
-                [parser_none], exception_key="parsing_error"
-            )
-            return RunnableMap(raw=llm) | parser_with_fallback
-        return llm | output_parser
+        else:
+            output_parser = StrOutputParser()
+        return self._wrap_with_include_raw(llm, output_parser, include_raw=include_raw)
+
+    def with_guided_regex(
+        self,
+        pattern: str,
+        *,
+        include_raw: bool = False,
+        guided_decoding_backend: str | None = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, str]:
+        r"""Force the model to emit output that matches a regular expression.
+
+        Uses vLLM's constrained decoding to guarantee every generated token
+        stays within the language defined by ``pattern``. This has no equivalent
+        in the OpenAI API.
+
+        Args:
+            pattern: A regular-expression string. The entire output is constrained
+                to match this pattern (the server applies it token-by-token).
+            include_raw: If ``True``, return a dict with ``'raw'``, ``'parsed'``,
+                and ``'parsing_error'`` keys.
+            guided_decoding_backend: Optional backend selector forwarded to vLLM
+                (e.g. ``"xgrammar"``).
+            kwargs: Passed through to ``bind``.
+
+        Returns:
+            A ``Runnable`` that returns a ``str`` guaranteed to match ``pattern``.
+
+        Example:
+            Force a phone-number format:
+
+            ```python
+            phone = llm.with_guided_regex(r"(\d{3}) \d{3}-\d{4}")
+            phone.invoke("Reach me at 4155551234")
+            # -> "(415) 555-1234"
+            ```
+        """
+        if not pattern:
+            msg = "pattern must be a non-empty string."
+            raise ValueError(msg)
+        extra_body = self._build_guided_extra_body(
+            kind="regex",
+            value=pattern,
+            guided_decoding_backend=guided_decoding_backend,
+        )
+        llm = self.bind(
+            extra_body=extra_body,
+            ls_structured_output_format={
+                "kwargs": {"method": "guided_regex"},
+                "schema": {"regex": pattern},
+            },
+            **kwargs,
+        )
+        return self._wrap_with_include_raw(
+            llm, StrOutputParser(), include_raw=include_raw
+        )
+
+    def with_guided_grammar(
+        self,
+        grammar: str,
+        *,
+        include_raw: bool = False,
+        guided_decoding_backend: str | None = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, str]:
+        """Force the model to emit output that conforms to a context-free grammar.
+
+        Uses vLLM's constrained decoding with a GBNF (GGML BNF) or EBNF grammar
+        string. This has no equivalent in the OpenAI API.
+
+        Args:
+            grammar: A grammar string in GBNF or EBNF format understood by the
+                vLLM server's configured guided-decoding backend.
+            include_raw: If ``True``, return a dict with ``'raw'``, ``'parsed'``,
+                and ``'parsing_error'`` keys.
+            guided_decoding_backend: Optional backend selector forwarded to vLLM
+                (e.g. ``"xgrammar"``).
+            kwargs: Passed through to ``bind``.
+
+        Returns:
+            A ``Runnable`` that returns a ``str`` conforming to ``grammar``.
+
+        Example:
+            Restrict output to simple ``SELECT`` SQL:
+
+            ```python
+            sql_grammar = '''
+            root   ::= "SELECT " column " FROM " table
+            column ::= "id" | "name" | "email"
+            table  ::= "users" | "orders"
+            '''
+            sql = llm.with_guided_grammar(sql_grammar)
+            sql.invoke("Get every user's email")
+            # -> "SELECT email FROM users"
+            ```
+        """
+        if not grammar:
+            msg = "grammar must be a non-empty string."
+            raise ValueError(msg)
+        extra_body = self._build_guided_extra_body(
+            kind="grammar",
+            value=grammar,
+            guided_decoding_backend=guided_decoding_backend,
+        )
+        llm = self.bind(
+            extra_body=extra_body,
+            ls_structured_output_format={
+                "kwargs": {"method": "guided_grammar"},
+                "schema": {"grammar": grammar},
+            },
+            **kwargs,
+        )
+        return self._wrap_with_include_raw(
+            llm, StrOutputParser(), include_raw=include_raw
+        )
